@@ -1,0 +1,42 @@
+# ----------------------------------------------------------------------------
+# Structure-from-Motion (COLMAP) configuration
+# ----------------------------------------------------------------------------
+
+# Path to the COLMAP executable. If not in PATH, give the absolute path.
+# On Windows: e.g. "C:/COLMAP/COLMAP-3.9.1-windows-cuda/COLMAP.bat"
+colmap_executable: colmap
+
+# How many frames to extract per pothole for SfM (the more, the better quality
+# but the slower). 5-10 is a good trade-off for short clips.
+num_frames_per_pothole: 8
+
+# Stride between extracted frames (within the bounding-box temporal window)
+frame_stride: 2
+
+# Image preprocessing
+image:
+  max_dim: 1600   # downscale long side before SfM (keeps COLMAP fast)
+
+# Feature extraction / matching strategy used when invoking COLMAP CLI
+feature_extractor:
+  use_gpu: true
+  single_camera: true       # all frames share intrinsics (same dash-cam)
+  camera_model: SIMPLE_RADIAL
+
+matcher:
+  type: exhaustive          # "exhaustive" or "sequential"
+  use_gpu: true
+
+mapper:
+  min_num_matches: 15
+  init_min_num_inliers: 50
+  multiple_models: false
+
+# Behaviour when COLMAP is not installed
+fallback:
+  # If true, fall back to a lightweight OpenCV two-view triangulation when
+  # COLMAP is unavailable. This is much less accurate but lets the pipeline
+  # still produce a result.
+  enable_opencv_fallback: true
+  num_features: 2000
+  ratio_test: 0.75

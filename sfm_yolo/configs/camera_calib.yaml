@@ -1,0 +1,28 @@
+# ----------------------------------------------------------------------------
+# Camera calibration parameters
+# ----------------------------------------------------------------------------
+# These values define the absolute scale reference used by the geometric
+# depth estimator. The single most important parameter is `camera_height_m`
+# which acts as the metric anchor for the entire pipeline.
+#
+# How to obtain each value:
+#   * camera_height_m   : Measure with a tape from ground to the front element
+#                         of the lens once the camera is mounted.
+#   * focal_length_px   : Run the OpenCV chessboard calibration helper
+#                         (see scripts/calibrate_camera.py - optional) or use
+#                         the EXIF / spec sheet of the camera. As a sanity
+#                         baseline:  f_px ~= 0.5 * image_width / tan(HFOV/2)
+#   * principal_point   : Default to image center [width/2, height/2].
+#   * pitch_deg         : Tilt of the optical axis below the horizon.
+#                         0 = camera looking perfectly horizontally forward.
+# ----------------------------------------------------------------------------
+
+camera_height_m: 1.52          # metres (dash-cam typical mount ~1.5 m)
+focal_length_px: 1400.0        # pixels (assume ~70 deg HFOV on 1920 px wide)
+principal_point: [960.0, 540.0]  # cx, cy (image center for 1920x1080)
+image_size: [1920, 1080]       # width, height in pixels
+pitch_deg: 0.0                 # camera tilt below horizon (positive = down)
+
+# Optional radial distortion (k1, k2, p1, p2, k3). Leave zeros if the camera
+# already produces undistorted frames or you do not have calibration data.
+distortion: [0.0, 0.0, 0.0, 0.0, 0.0]

@@ -1,0 +1,50 @@
+# ----------------------------------------------------------------------------
+# YOLOv8 fine-tuning configuration for pothole detection
+# ----------------------------------------------------------------------------
+
+# Pre-trained weights to start from (downloaded automatically by ultralytics)
+base_model: yolov8n.pt
+
+# Where to save trained weights / runs
+project_dir: outputs/yolo_runs
+run_name: pothole_yolov8n
+
+# Training hyper-parameters
+epochs: 50
+batch_size: 16
+img_size: 640
+patience: 15            # early stopping
+device: ""              # "" -> auto (cuda if available, else cpu); "cpu" forces CPU
+workers: 4
+seed: 42
+
+# Augmentation (ultralytics defaults are sensible for road imagery)
+augment:
+  hsv_h: 0.015
+  hsv_s: 0.7
+  hsv_v: 0.4
+  degrees: 0.0
+  translate: 0.1
+  scale: 0.5
+  shear: 0.0
+  fliplr: 0.5
+  mosaic: 1.0
+
+# Inference / runtime
+inference:
+  conf_threshold: 0.4
+  iou_threshold: 0.5
+  max_detections: 30
+
+# Dataset preparation
+dataset:
+  # Mendeley pothole video dataset root (rgb/ + mask/ inside train/val/test)
+  source_root: data/pothole_video/pothole_video
+  # Where the YOLO-format dataset will be written
+  yolo_root: sfm_yolo/data/yolo_dataset
+  # Extract every Nth frame from each clip (1 = every frame, expensive)
+  frame_stride: 5
+  # Discard masks with fewer than this many foreground pixels
+  min_mask_pixels: 80
+  # Names of pothole class(es)
+  class_names: ["pothole"]

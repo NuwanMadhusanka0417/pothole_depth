@@ -1,0 +1,48 @@
+# ----------------------------------------------------------------------------
+# End-to-end pipeline configuration
+# ----------------------------------------------------------------------------
+
+# Sub-config files (relative to project root)
+camera_config: sfm_yolo/configs/camera_calib.yaml
+yolo_config: sfm_yolo/configs/yolo_config.yaml
+sfm_config: sfm_yolo/configs/sfm_config.yaml
+
+# Trained YOLO weights (set after training)
+yolo_weights: sfm_yolo/models/pothole_yolov8n.pt
+
+# Output directory for results
+output_dir: sfm_yolo/outputs/runs
+
+# Frame processing (downscale before detection / depth / overlay)
+processing:
+  scale: 0.5    # 1.0 = full resolution; 0.5 = half width and height
+
+# Detection / tracking
+tracker:
+  # IoU threshold for naive frame-to-frame association
+  iou_threshold: 0.3
+  # Minimum number of consecutive detections required to "confirm" a pothole
+  min_track_length: 3
+  # Maximum frames a track can be missing before being terminated
+  max_age: 5
+
+# Hybrid fusion knobs
+fusion:
+  # Weight given to geometric depth versus SfM-derived depth in the final
+  # consensus. Both confidences are used, this is a soft prior.
+  geometric_weight: 0.55
+  sfm_weight: 0.45
+  # Maximum allowable disagreement (relative) before a result is flagged
+  # as low-confidence: |d_geo - d_sfm| / mean(d) < this threshold.
+  disagreement_threshold: 0.30
+  # Minimum acceptable confidence to publish a depth estimate.
+  min_confidence: 0.35
+
+# Visualization / outputs
+visualization:
+  draw_bbox: true
+  draw_depth_label: true
+  save_overlay_video: true
+  save_depth_map: false      # geometric ground-plane heatmap (sanity check only)
+  save_pointcloud: false     # writes .ply per pothole if SfM ran
+  save_summary: false        # writes summary.json with per-track depths
