@@ -30,8 +30,10 @@ from __future__ import annotations
 
 import argparse
 import json
+import math
 import shutil
 import tempfile
+from collections import Counter
 from dataclasses import asdict
 from pathlib import Path
 from typing import Dict, List, Optional, Sequence, Tuple
@@ -49,10 +51,20 @@ from .fusion.depth_map_generator import (
     write_image,
 )
 from .fusion.hybrid_estimator import HybridDepthEstimator, HybridDepthResult
+from .geometry.frame_rotation import rotate_image, rotate_intrinsics
 from .geometry.geometric_depth import GeometricDepthEstimator
+from .geometry.imu_orientation import (
+    FRONT_CAMERA_AXIS,
+    REAR_CAMERA_AXIS,
+    gravity_vector_from_imu,
+    orientation_from_imu,
+    quarter_turns_to_upright,
+    residual_roll_rad,
+)
 from .reconstruction.sfm_runner import SfMRunner
 from .utils.camera_calibration import CameraIntrinsics, load_camera_calibration
 from .utils.data_loader import MendeleyVideoDataset, mask_to_bboxes
+from .utils.misensorkit_loader import MiSensorKitDataset
 from .utils.logging_utils import get_logger
 
 _logger = get_logger("main")
@@ -506,6 +518,200 @@ def _write_overlay_video(
 
 
 # ---------------------------------------------------------------------------
+# RGB + IMU pipeline (misensorkit phone captures)
+# ---------------------------------------------------------------------------
+def process_misensorkit(
+    folder: str | Path,
+    output_dir: str | Path,
+    *,
+    detector: Optional[YOLODetector],
+    pipeline_cfg: dict,
+    camera_height_m: float,
+    camera_facing: str = "rear",
+    pitch_offset_deg: float = 0.0,
+    roll_warn_deg: float = 10.0,
+    save_overlay_video: bool = True,
+    save_summary: bool = True,
+    every_nth_detect: int = 1,
+) -> Dict:
+    """Estimate pothole depth from a misensorkit recording using RGB + IMU only.
+
+    For every frame the camera pitch below the horizon is recovered from
+    the IMU gravity vector and fed into the geometric depth model in place
+    of the static calibration pitch. Absolute scale comes from
+    ``camera_height_m`` (the metric anchor). Depth/GPS/extrinsics streams
+    are intentionally **not** used.
+    """
+    folder = Path(folder)
+    output_dir = Path(output_dir)
+    output_dir.mkdir(parents=True, exist_ok=True)
+
+    if detector is None:
+        raise RuntimeError(
+            "The RGB+IMU pipeline needs YOLO weights (no mask fallback available). "
+            "Check yolo_weights in the pipeline config."
+        )
+    if camera_height_m <= 0:
+        raise ValueError("camera_height_m must be positive (it is the scale anchor)")
+
+    ds = MiSensorKitDataset(folder)
+
+    # The optical-axis convention depends on which physical camera recorded
+    # the clip; warn if the user's flag disagrees with the recording hint.
+    hint = ds.camera_family_hint()
+    if hint and camera_facing.lower() not in hint.lower():
+        _logger.warning(
+            "camera_facing=%r but the recording metadata says camera_family=%r. "
+            "The IMU->pitch sign depends on this; verify the convention.",
+            camera_facing, hint,
+        )
+
+    axis = REAR_CAMERA_AXIS if camera_facing == "rear" else FRONT_CAMERA_AXIS
+    pitch_off = math.radians(pitch_offset_deg)
+
+    # Decide a single upright rotation for the whole clip from the IMU. Using
+    # one dominant turn count keeps a consistent coordinate space for tracking.
+    # The pitch the depth model uses comes from gz and is rotation-invariant,
+    # so this only re-levels the horizon -- it never alters the IMU pitch.
+    per_frame_k = [quarter_turns_to_upright(gravity_vector_from_imu(f.imu)) for f in ds.frames]
+    upright_k = Counter(per_frame_k).most_common(1)[0][0]
+
+    intr = rotate_intrinsics(ds.camera_intrinsics(camera_height_m), upright_k)
+    geometric = GeometricDepthEstimator(intr)
+    _logger.info(
+        "Upright rotation: k=%d (%d deg CCW). Intrinsics after rotation: "
+        "%dx%d f=%.1fpx pp=(%.1f,%.1f) h=%.3fm",
+        upright_k, upright_k * 90,
+        intr.width, intr.height, intr.fx, intr.cx, intr.cy, intr.camera_height_m,
+    )
+
+    # Load frames (rotated upright) and per-frame orientation. Pitch is from
+    # the original gravity (gz component) and is unaffected by the rotation.
+    frames: List[np.ndarray] = []
+    orientations = []
+    residual_rolls_deg: List[float] = []
+    for f in ds.frames:
+        frames.append(rotate_image(f.load_rgb(), upright_k))
+        orientations.append(
+            orientation_from_imu(f.imu, camera_axis=axis, pitch_offset_rad=pitch_off)
+        )
+        residual_rolls_deg.append(
+            math.degrees(residual_roll_rad(gravity_vector_from_imu(f.imu), upright_k))
+        )
+
+    pitches_deg = [o.pitch_deg for o in orientations if o.is_valid]
+    if pitches_deg:
+        _logger.info(
+            "IMU pitch over clip: min=%.1f median=%.1f max=%.1f deg | "
+            "residual roll after upright: mean=%.1f max=%.1f deg",
+            float(np.min(pitches_deg)), float(np.median(pitches_deg)), float(np.max(pitches_deg)),
+            float(np.mean(np.abs(residual_rolls_deg))), float(np.max(np.abs(residual_rolls_deg))),
+        )
+
+    # 1) Detect potholes per frame.
+    per_frame_dets: List[List[Detection]] = [
+        detector.detect(fr) if (i % every_nth_detect == 0) else []
+        for i, fr in enumerate(frames)
+    ]
+    n_dets = sum(len(d) for d in per_frame_dets)
+    _logger.info("Total detections: %d over %d frames", n_dets, len(frames))
+
+    # 2) Associate across frames (greedy IoU).
+    tracker_cfg = pipeline_cfg.get("tracker", {})
+    iou_thr = float(tracker_cfg.get("iou_threshold", 0.3))
+    min_track = int(tracker_cfg.get("min_track_length", 3))
+    max_age = int(tracker_cfg.get("max_age", 5))
+    tracks = detector.track_across_frames(
+        list(enumerate(per_frame_dets)), iou_threshold=iou_thr, max_age=max_age
+    )
+    confirmed = [t for t in tracks if len(t) >= min_track]
+    _logger.info("Tracks: total=%d confirmed(>= %d)=%d", len(tracks), min_track, len(confirmed))
+
+    # 3) Per-track geometric depth, using each frame's IMU pitch.
+    track_results: List[Dict] = []
+    for tid, track in enumerate(confirmed):
+        bboxes: List[Tuple[float, float, float, float]] = []
+        pitches: List[float] = []
+        rolls: List[float] = []
+        frame_indices: List[int] = []
+        for det in track:
+            fi = _find_frame_index(per_frame_dets, det)
+            if fi is None or not orientations[fi].is_valid:
+                continue
+            bboxes.append(tuple(det.bbox))
+            pitches.append(orientations[fi].pitch_rad)
+            rolls.append(residual_rolls_deg[fi])  # roll left after upright rotation
+            frame_indices.append(fi)
+        if not bboxes:
+            continue
+
+        if len(bboxes) >= 2:
+            result = geometric.multi_frame_validation(bboxes, pitch_rads=pitches)
+        else:
+            result = geometric.single_frame_depth(bboxes[0], pitch_rad=pitches[0])
+
+        # The geometric model is pitch-only; a large *residual* roll (after the
+        # upright rotation) still breaks its level-horizon assumption, so flag
+        # it and damp confidence.
+        mean_roll_deg = float(np.mean(np.abs(rolls)))
+        if mean_roll_deg > roll_warn_deg:
+            result.confidence *= 0.5
+            result.notes = (result.notes + " | " if result.notes else "") + \
+                f"high roll {mean_roll_deg:.1f}deg (pitch-only model)"
+
+        track_results.append(
+            {
+                "track_id": tid,
+                "n_frames": len(bboxes),
+                "frame_indices": frame_indices,
+                "bbox_mid": list(bboxes[len(bboxes) // 2]),
+                "mean_pitch_deg": float(np.degrees(np.mean(pitches))),
+                "mean_roll_deg": mean_roll_deg,
+                "result": result.as_dict(),
+            }
+        )
+        _logger.info(
+            "Track %d: depth=%.1f cm conf=%.2f (n=%d, pitch~%.1f deg)",
+            tid, result.depth_m * 100.0, result.confidence, len(bboxes),
+            float(np.degrees(np.mean(pitches))),
+        )
+
+    summary = {
+        "recording": str(folder),
+        "method": "rgb+imu (per-frame IMU pitch + geometric)",
+        "camera_height_m": camera_height_m,
+        "camera_facing": camera_facing,
+        "pitch_offset_deg": pitch_offset_deg,
+        "upright_rotation_k": upright_k,
+        "upright_rotation_deg_ccw": upright_k * 90,
+        "frames": len(frames),
+        "detections_total": n_dets,
+        "tracks_total": len(tracks),
+        "tracks_confirmed": len(confirmed),
+        "tracks": track_results,
+    }
+
+    if save_overlay_video and frames:
+        out_overlay = output_dir / f"{ds.folder.name}.mp4"
+        _write_overlay_video(
+            frames=frames,
+            per_frame_dets=per_frame_dets,
+            track_results=track_results,
+            confirmed_tracks=confirmed,
+            out_path=out_overlay,
+        )
+        _logger.info("Wrote overlay video to %s", out_overlay)
+
+    if save_summary:
+        summary_path = output_dir / "summary.json"
+        with open(summary_path, "w", encoding="utf-8") as f:
+            json.dump(summary, f, indent=2, default=str)
+        _logger.info("Wrote summary to %s", summary_path)
+
+    return summary
+
+
+# ---------------------------------------------------------------------------
 # Batch over a folder of videos
 # ---------------------------------------------------------------------------
 def process_folder(
@@ -689,7 +895,46 @@ def main() -> None:
                           help="Process at most this many videos")
     _common_args(p_folder)
 
+    p_imu = sub.add_parser(
+        "imu", help="Estimate depth from a misensorkit RGB+IMU recording"
+    )
+    p_imu.add_argument("--input", required=True,
+                       help="misensorkit recording folder (contains rgb/ and imu/)")
+    p_imu.add_argument("--output", required=True, help="Output directory")
+    p_imu.add_argument("--camera-height", type=float, default=None,
+                       help="Camera height above the road in metres (scale anchor). "
+                            "Defaults to camera_height_m from the camera config.")
+    p_imu.add_argument("--camera-facing", choices=("rear", "front"), default="rear",
+                       help="Which physical camera recorded the clip (sets the "
+                            "IMU optical-axis convention). Default: rear.")
+    p_imu.add_argument("--pitch-offset-deg", type=float, default=0.0,
+                       help="Constant pitch correction for mounting/convention bias.")
+    p_imu.add_argument("--config", default="sfm_yolo/configs/pipeline.yaml")
+    p_imu.add_argument("--weights", default=None, help="Override YOLO weights path")
+    p_imu.add_argument("--no-overlay", action="store_true", help="Disable overlay video")
+
     args = parser.parse_args()
+
+    if args.cmd == "imu":
+        detector, hybrid, pipeline_cfg = build_components(
+            args.config, use_sfm=False, yolo_weights_override=args.weights,
+        )
+        camera_height = args.camera_height
+        if camera_height is None:
+            camera_height = hybrid.geometric.intrinsics.camera_height_m
+            _logger.info("Using camera_height=%.3f m from camera config", camera_height)
+        process_misensorkit(
+            args.input,
+            args.output,
+            detector=detector,
+            pipeline_cfg=pipeline_cfg,
+            camera_height_m=camera_height,
+            camera_facing=args.camera_facing,
+            pitch_offset_deg=args.pitch_offset_deg,
+            save_overlay_video=not args.no_overlay,
+            save_summary=True,
+        )
+        return
 
     detector, hybrid, pipeline_cfg = build_components(
         args.config,

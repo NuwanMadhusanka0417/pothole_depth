@@ -50,6 +50,14 @@ def get_logger(
         root.setLevel(_resolve_level(level))
         root.propagate = False
 
+        # The Windows console defaults to cp1252, which crashes on characters
+        # such as the U+202F space iOS puts in capture-folder names. Make
+        # stdout tolerant so a stray glyph never aborts a log line.
+        try:
+            sys.stdout.reconfigure(errors="backslashreplace")  # py3.7+
+        except (AttributeError, ValueError):  # pragma: no cover - non-reconfigurable stream
+            pass
+
         stream = logging.StreamHandler(sys.stdout)
         stream.setFormatter(logging.Formatter(_FORMAT))
         root.addHandler(stream)

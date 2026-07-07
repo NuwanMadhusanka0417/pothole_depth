@@ -132,10 +132,20 @@ class GeometricDepthEstimator:
     # ------------------------------------------------------------------
     # Low-level conversions (vectorised, expose the math)
     # ------------------------------------------------------------------
-    def pixel_to_angle(self, pixel_y: float | np.ndarray) -> float | np.ndarray:
-        """Pixel row -> angle below horizon (radians)."""
+    def pixel_to_angle(
+        self,
+        pixel_y: float | np.ndarray,
+        *,
+        pitch_rad: Optional[float] = None,
+    ) -> float | np.ndarray:
+        """Pixel row -> angle below horizon (radians).
+
+        ``pitch_rad`` overrides the static calibration pitch for this call
+        only -- pass the per-frame value from the IMU here.
+        """
+        pitch = self._pitch if pitch_rad is None else float(pitch_rad)
         return pixel_y_to_angle(
-            pixel_y, cy=self._cy, focal_length_px=self._fy, pitch_rad=self._pitch
+            pixel_y, cy=self._cy, focal_length_px=self._fy, pitch_rad=pitch
         )
 
     def angle_to_distance(self, theta: float | np.ndarray) -> float | np.ndarray:
@@ -166,6 +176,7 @@ class GeometricDepthEstimator:
         bbox: BBox,
         *,
         road_pixel_y: Optional[float] = None,
+        pitch_rad: Optional[float] = None,
     ) -> GeometricDepthResult:
         """Estimate pothole depth from a single bounding box.
 
@@ -178,6 +189,12 @@ class GeometricDepthEstimator:
             use the top edge ``y1`` of the bounding box (a reasonable
             proxy for the road plane that would exist if the pothole
             were filled).
+        pitch_rad : float, optional
+            Per-frame camera pitch below horizon (radians). When supplied
+            -- e.g. derived from the IMU gravity vector -- it overrides the
+            static calibration pitch for this frame. This is the key input
+            that makes the estimate robust to a non-level / hand-held
+            camera.
 
         Returns
         -------
@@ -192,8 +209,8 @@ class GeometricDepthEstimator:
                 f"road row ({y_road}) must be above the pothole bottom row ({y_bot})"
             )
 
-        theta_road = float(self.pixel_to_angle(y_road))
-        theta_bot = float(self.pixel_to_angle(y_bot))
+        theta_road = float(self.pixel_to_angle(y_road, pitch_rad=pitch_rad))
+        theta_bot = float(self.pixel_to_angle(y_bot, pitch_rad=pitch_rad))
 
         # Both rows must be below the horizon (positive theta) for the
         # ground-plane projection to be valid.
@@ -292,22 +309,30 @@ class GeometricDepthEstimator:
         bboxes: Sequence[BBox],
         *,
         road_pixel_ys: Optional[Sequence[float]] = None,
+        pitch_rads: Optional[Sequence[float]] = None,
     ) -> GeometricDepthResult:
         """Robust depth estimate from N >= 2 same-pothole bounding boxes.
 
         Uses the **median** of per-frame depths (outlier tolerant) and
         reports a confidence based on the median absolute deviation.
+
+        ``pitch_rads`` -- one per bbox -- supplies the per-frame camera
+        pitch (e.g. from the IMU), making each frame's estimate robust to
+        a non-level camera before they are combined.
         """
         if len(bboxes) < 2:
             raise ValueError("multi_frame_validation requires at least 2 bboxes")
         if road_pixel_ys is not None and len(road_pixel_ys) != len(bboxes):
             raise ValueError("road_pixel_ys must match bboxes length")
+        if pitch_rads is not None and len(pitch_rads) != len(bboxes):
+            raise ValueError("pitch_rads must match bboxes length")
 
         per_frame_results: List[GeometricDepthResult] = []
         depths: List[float] = []
         for i, bbox in enumerate(bboxes):
             road_y = road_pixel_ys[i] if road_pixel_ys is not None else None
-            res = self.single_frame_depth(bbox, road_pixel_y=road_y)
+            pitch = pitch_rads[i] if pitch_rads is not None else None
+            res = self.single_frame_depth(bbox, road_pixel_y=road_y, pitch_rad=pitch)
             per_frame_results.append(res)
             if math.isfinite(res.depth_m):
                 depths.append(res.depth_m)
