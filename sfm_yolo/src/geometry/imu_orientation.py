@@ -214,3 +214,30 @@ def residual_roll_rad(gravity: np.ndarray, k: int) -> float:
     for _ in range(k % 4):
         vx, vy = _turn_once(vx, vy)
     return math.atan2(vx, vy)  # angle of in-image gravity away from straight-down
+
+
+def gravity_camera_frame(
+    gravity: np.ndarray,
+    *,
+    camera_axis: Tuple[float, float, float] = REAR_CAMERA_AXIS,
+    k: int = 0,
+) -> np.ndarray:
+    """Gravity in the OpenCV camera frame (x right, y down, z forward) of the
+    ``k``-times-upright-rotated image. Points *down*; unit length.
+
+    Needed by :mod:`plane_depth` to orient the road plane. The device frame is
+    (x right, y up, z toward the user). For the rear camera the optical axis is
+    -Z_device (into the scene); for the front camera it is +Z_device and the
+    image is mirrored in x. After mapping to the OpenCV frame we apply the same
+    in-plane rotation the image received.
+    """
+    gx, gy, gz = (float(v) for v in gravity)
+    if camera_axis[2] < 0:      # rear / world camera
+        cx, cy, cz = gx, -gy, -gz
+    else:                        # front camera (mirrored in x)
+        cx, cy, cz = -gx, -gy, gz
+    for _ in range(k % 4):       # match the image's np.rot90 turns
+        cx, cy = _turn_once(cx, cy)
+    v = np.array([cx, cy, cz], dtype=np.float64)
+    n = float(np.linalg.norm(v))
+    return v / n if n > 1e-12 else v

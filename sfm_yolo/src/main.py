@@ -51,16 +51,20 @@ from .fusion.depth_map_generator import (
     write_image,
 )
 from .fusion.hybrid_estimator import HybridDepthEstimator, HybridDepthResult
+from .fusion.depth_compare import compare_pair
+from .fusion.mono_depth import MetricDepthModel, is_available as mono_depth_available
 from .geometry.frame_rotation import rotate_image, rotate_intrinsics
 from .geometry.geometric_depth import GeometricDepthEstimator
 from .geometry.imu_orientation import (
     FRONT_CAMERA_AXIS,
     REAR_CAMERA_AXIS,
+    gravity_camera_frame,
     gravity_vector_from_imu,
     orientation_from_imu,
     quarter_turns_to_upright,
     residual_roll_rad,
 )
+from .geometry.plane_depth import pothole_depth_from_depthmap
 from .reconstruction.sfm_runner import SfMRunner
 from .utils.camera_calibration import CameraIntrinsics, load_camera_calibration
 from .utils.data_loader import MendeleyVideoDataset, mask_to_bboxes
@@ -530,6 +534,8 @@ def process_misensorkit(
     camera_facing: str = "rear",
     pitch_offset_deg: float = 0.0,
     roll_warn_deg: float = 10.0,
+    depth_method: str = "geometric",
+    mono_model: Optional[MetricDepthModel] = None,
     save_overlay_video: bool = True,
     save_summary: bool = True,
     every_nth_detect: int = 1,
@@ -627,8 +633,10 @@ def process_misensorkit(
     confirmed = [t for t in tracks if len(t) >= min_track]
     _logger.info("Tracks: total=%d confirmed(>= %d)=%d", len(tracks), min_track, len(confirmed))
 
-    # 3) Per-track geometric depth, using each frame's IMU pitch.
+    # 3) Per-track depth. The geometric bbox estimate is kept as a loose bound;
+    #    Path B (metric depth + gravity plane fit) gives the true below-plane drop.
     track_results: List[Dict] = []
+    mono_depth_cache: Dict[int, np.ndarray] = {}
     for tid, track in enumerate(confirmed):
         bboxes: List[Tuple[float, float, float, float]] = []
         pitches: List[float] = []
@@ -645,40 +653,81 @@ def process_misensorkit(
         if not bboxes:
             continue
 
+        # Geometric bbox estimate (loose bound; measures footprint, not the
+        # vertical drop). Kept for comparison, not as the primary depth.
         if len(bboxes) >= 2:
-            result = geometric.multi_frame_validation(bboxes, pitch_rads=pitches)
+            geo_result = geometric.multi_frame_validation(bboxes, pitch_rads=pitches)
         else:
-            result = geometric.single_frame_depth(bboxes[0], pitch_rad=pitches[0])
+            geo_result = geometric.single_frame_depth(bboxes[0], pitch_rad=pitches[0])
 
-        # The geometric model is pitch-only; a large *residual* roll (after the
-        # upright rotation) still breaks its level-horizon assumption, so flag
-        # it and damp confidence.
         mean_roll_deg = float(np.mean(np.abs(rolls)))
         if mean_roll_deg > roll_warn_deg:
-            result.confidence *= 0.5
-            result.notes = (result.notes + " | " if result.notes else "") + \
+            geo_result.confidence *= 0.5
+            geo_result.notes = (geo_result.notes + " | " if geo_result.notes else "") + \
                 f"high roll {mean_roll_deg:.1f}deg (pitch-only model)"
 
-        track_results.append(
-            {
-                "track_id": tid,
-                "n_frames": len(bboxes),
-                "frame_indices": frame_indices,
-                "bbox_mid": list(bboxes[len(bboxes) // 2]),
-                "mean_pitch_deg": float(np.degrees(np.mean(pitches))),
-                "mean_roll_deg": mean_roll_deg,
-                "result": result.as_dict(),
-            }
-        )
+        # Path B: metric depth + gravity-oriented road-plane fit -> true drop.
+        mono_depth_m = float("nan")
+        mono_conf = 0.0
+        if mono_model is not None and depth_method in ("monodepth", "both"):
+            ridx = int(np.argmax([(b[2] - b[0]) * (b[3] - b[1]) for b in bboxes]))
+            ref_fi = frame_indices[ridx]
+            ref_bbox = bboxes[ridx]
+            if ref_fi not in mono_depth_cache:
+                mono_depth_cache[ref_fi] = mono_model.infer(frames[ref_fi])
+            g_cam = gravity_camera_frame(
+                gravity_vector_from_imu(ds.frames[ref_fi].imu),
+                camera_axis=axis, k=upright_k,
+            )
+            pres = pothole_depth_from_depthmap(
+                mono_depth_cache[ref_fi], ref_bbox,
+                fx=intr.fx, fy=intr.fy, cx=intr.cx, cy=intr.cy,
+                gravity_cam=g_cam,
+            )
+            mono_depth_m, mono_conf = pres.depth_m, pres.confidence
+
+        # Reported depth per the requested method.
+        if depth_method == "monodepth" and np.isfinite(mono_depth_m):
+            primary_depth, primary_conf, primary_name = mono_depth_m, mono_conf, "monodepth-plane"
+        else:
+            primary_depth, primary_conf, primary_name = \
+                geo_result.depth_m, geo_result.confidence, "geometric-bbox"
+
+        result_dict = geo_result.as_dict()
+        result_dict["depth_m"] = primary_depth        # overlay shows the primary depth
+        result_dict["confidence"] = primary_conf
+        result_dict["depth_source"] = primary_name
+
+        entry = {
+            "track_id": tid,
+            "n_frames": len(bboxes),
+            "frame_indices": frame_indices,
+            "bbox_mid": list(bboxes[len(bboxes) // 2]),
+            "mean_pitch_deg": float(np.degrees(np.mean(pitches))),
+            "mean_roll_deg": mean_roll_deg,
+            "depth_m": primary_depth,
+            "confidence": primary_conf,
+            "depth_source": primary_name,
+            "geometric_bbox_depth_m": geo_result.depth_m,
+            "monodepth_plane_depth_m": mono_depth_m,
+            "monodepth_confidence": mono_conf,
+            "result": result_dict,
+        }
+        if depth_method == "both" and np.isfinite(mono_depth_m):
+            entry["path_a_vs_b"] = compare_pair(geo_result.depth_m, mono_depth_m).as_dict()
+        track_results.append(entry)
+
         _logger.info(
-            "Track %d: depth=%.1f cm conf=%.2f (n=%d, pitch~%.1f deg)",
-            tid, result.depth_m * 100.0, result.confidence, len(bboxes),
+            "Track %d: %s depth=%.1f cm conf=%.2f (n=%d, pitch~%.1f deg)%s",
+            tid, primary_name, primary_depth * 100.0, primary_conf, len(bboxes),
             float(np.degrees(np.mean(pitches))),
+            (f" | monodepth={mono_depth_m * 100.0:.1f} cm" if np.isfinite(mono_depth_m) else ""),
         )
 
     summary = {
         "recording": str(folder),
-        "method": "rgb+imu (per-frame IMU pitch + geometric)",
+        "method": f"rgb+imu (upright + {depth_method})",
+        "depth_method": depth_method,
         "camera_height_m": camera_height_m,
         "camera_facing": camera_facing,
         "pitch_offset_deg": pitch_offset_deg,
@@ -909,6 +958,14 @@ def main() -> None:
                             "IMU optical-axis convention). Default: rear.")
     p_imu.add_argument("--pitch-offset-deg", type=float, default=0.0,
                        help="Constant pitch correction for mounting/convention bias.")
+    p_imu.add_argument("--depth-method", choices=("geometric", "monodepth", "both"),
+                       default="geometric",
+                       help="geometric = bbox bound (fast, inaccurate); monodepth = "
+                            "metric depth + gravity plane fit (Path B); both = compute "
+                            "both and record the A-vs-B comparison.")
+    p_imu.add_argument("--mono-model", default=None,
+                       help="HuggingFace metric depth model id (Path B). Defaults to "
+                            "DepthAnything V2 metric.")
     p_imu.add_argument("--config", default="sfm_yolo/configs/pipeline.yaml")
     p_imu.add_argument("--weights", default=None, help="Override YOLO weights path")
     p_imu.add_argument("--no-overlay", action="store_true", help="Disable overlay video")
@@ -923,6 +980,17 @@ def main() -> None:
         if camera_height is None:
             camera_height = hybrid.geometric.intrinsics.camera_height_m
             _logger.info("Using camera_height=%.3f m from camera config", camera_height)
+
+        mono_model = None
+        if args.depth_method in ("monodepth", "both"):
+            if not mono_depth_available():
+                parser.error(
+                    "--depth-method requires the metric depth model. Install it:\n"
+                    "    <road-env-python> -m pip install transformers timm"
+                )
+            model_name = args.mono_model
+            mono_model = MetricDepthModel(model_name) if model_name else MetricDepthModel()
+
         process_misensorkit(
             args.input,
             args.output,
@@ -931,6 +999,8 @@ def main() -> None:
             camera_height_m=camera_height,
             camera_facing=args.camera_facing,
             pitch_offset_deg=args.pitch_offset_deg,
+            depth_method=args.depth_method,
+            mono_model=mono_model,
             save_overlay_video=not args.no_overlay,
             save_summary=True,
         )
