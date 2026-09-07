@@ -1,0 +1,7 @@
+/data/*
+/.gitignore
+/sfm_yolo/.gitignore
+/.vscode/settings.json
+/gpt_based/pothole_vision/.venv/*
+/gpt_based/pothole_vision/.pytest_cache/*
+*.pyc"gpt_based/pothole_vision/data/input/dashcam.mp4" 
