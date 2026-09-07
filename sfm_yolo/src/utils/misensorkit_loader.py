@@ -37,6 +37,14 @@ from .logging_utils import get_logger
 _logger = get_logger("misensorkit")
 
 _FRAME_RE = re.compile(r"frame_(\d+)")
+_GRAVITY_KEYS = ("gravity_x_g", "gravity_y_g", "gravity_z_g")
+
+
+def is_usable_imu_record(imu: dict) -> bool:
+    """Return True if a misensorkit IMU JSON has gravity measurements."""
+    if imu.get("available") is False:
+        return False
+    return all(k in imu for k in _GRAVITY_KEYS)
 
 
 def _frame_id(path: Path) -> Optional[str]:
@@ -154,21 +162,31 @@ class MiSensorKitDataset:
 
         common = sorted(set(rgb) & set(imu))
         frames: List[MiSensorKitFrame] = []
-        for i, fid in enumerate(common):
+        skipped = 0
+        for fid in common:
             with imu[fid].open("r", encoding="utf-8") as f:
                 imu_rec = json.load(f)
+            if not is_usable_imu_record(imu_rec):
+                skipped += 1
+                continue
             intr = None
             if fid in cam:
                 with cam[fid].open("r", encoding="utf-8") as f:
                     intr = json.load(f).get("intrinsics")
             frames.append(
                 MiSensorKitFrame(
-                    index=i,
+                    index=len(frames),
                     frame_id=fid,
                     rgb_path=rgb[fid],
                     imu=imu_rec,
                     intrinsics=intr,
                 )
+            )
+        if skipped:
+            _logger.warning(
+                "Skipped %d frame(s) with unavailable IMU data "
+                "(available=false or missing gravity_* fields)",
+                skipped,
             )
         return frames
 

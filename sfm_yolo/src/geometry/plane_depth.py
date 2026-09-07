@@ -44,6 +44,8 @@ class PlaneDepthResult:
     n_interior_points: int
     confidence: float
     plane: Optional[Tuple[float, float, float, float]] = None  # (a,b,c,d), normal up
+    scale: float = 1.0                 # metric anchor factor applied (1 = none)
+    plane_dist: float = float("nan")   # camera->road distance in the input scale
     notes: str = ""
 
     def as_dict(self) -> dict:
@@ -53,6 +55,8 @@ class PlaneDepthResult:
             "n_interior_points": self.n_interior_points,
             "confidence": self.confidence,
             "plane": list(self.plane) if self.plane is not None else None,
+            "scale": self.scale,
+            "plane_dist": self.plane_dist,
             "notes": self.notes,
         }
 
@@ -115,12 +119,20 @@ def depth_below_plane(
     dist_thresh: float = 0.006,
     ransac_iters: int = 300,
     drop_percentile: float = 95.0,
+    camera_height_m: Optional[float] = None,
 ) -> PlaneDepthResult:
     """Depth of ``interior_pts`` below the plane fitted to ``road_pts``.
 
     ``gravity_cam`` is the gravity direction in the SAME camera frame as the
     points (points down); it is used only to orient the plane normal upward and
     to pick the "below road" side.
+
+    ``camera_height_m`` (optional) turns on **IMU scale anchoring**: the
+    perpendicular distance from the camera to the fitted road plane must equal
+    the known camera height, so we rescale the measured drop by
+    ``camera_height_m / plane_distance``. This removes the per-frame scale drift
+    of a learned depth map and fixes its near-field miscalibration, making the
+    depth consistent across frames.
     """
     road_pts = np.asarray(road_pts, dtype=np.float64).reshape(-1, 3)
     interior_pts = np.asarray(interior_pts, dtype=np.float64).reshape(-1, 3)
@@ -146,6 +158,15 @@ def depth_below_plane(
     s = interior_pts @ nrm + d
     # Deepest points have the most negative s; take a robust tail.
     drop = -float(np.percentile(s, 100.0 - drop_percentile))
+
+    # IMU scale anchoring: the camera-to-plane perpendicular distance (|d|,
+    # because the normal is unit) must equal the known camera height.
+    plane_dist = abs(float(d))
+    scale = 1.0
+    if camera_height_m is not None and plane_dist > 1e-6:
+        scale = float(camera_height_m) / plane_dist
+        drop *= scale
+
     depth = max(0.0, drop)
 
     inlier_ratio = n_in / max(1, len(road_pts))
@@ -159,7 +180,9 @@ def depth_below_plane(
         n_interior_points=int(len(interior_pts)),
         confidence=confidence,
         plane=(float(nrm[0]), float(nrm[1]), float(nrm[2]), float(d)),
-        notes=f"inlier_ratio={inlier_ratio:.2f}, below_frac={below_frac:.2f}",
+        scale=scale,
+        plane_dist=plane_dist,
+        notes=f"inlier_ratio={inlier_ratio:.2f}, below_frac={below_frac:.2f}, scale={scale:.3f}",
     )
 
 
@@ -184,6 +207,7 @@ def pothole_depth_from_depthmap(
     cx: float,
     cy: float,
     gravity_cam: np.ndarray,
+    camera_height_m: Optional[float] = None,
     ring_margin: float = 0.6,
     interior_shrink: float = 0.15,
     dist_thresh: float = 0.006,
@@ -237,4 +261,89 @@ def pothole_depth_from_depthmap(
     return depth_below_plane(
         road_pts, int_pts, gravity_cam,
         dist_thresh=dist_thresh, drop_percentile=drop_percentile,
+        camera_height_m=camera_height_m,
     )
+
+
+# ---------------------------------------------------------------------------
+# Convenience: depth from an SfM point cloud (Path A)
+# ---------------------------------------------------------------------------
+def pothole_depth_from_points(
+    points_cam: np.ndarray,
+    bbox: BBox,
+    *,
+    K: np.ndarray,
+    gravity_cam: np.ndarray,
+    camera_height_m: Optional[float] = None,
+    ring_margin: float = 0.6,
+    interior_shrink: float = 0.15,
+    dist_thresh: float = 0.006,
+    drop_percentile: float = 95.0,
+    rel_prescale_thresh: float = 0.02,
+    min_points: int = 8,
+) -> PlaneDepthResult:
+    """Pothole depth from an SfM 3D point cloud (Path A).
+
+    Parameters
+    ----------
+    points_cam : (N, 3)
+        Point cloud expressed in the **reference camera's** frame (origin at the
+        camera centre). An SfM cloud is in an arbitrary scale -- that is fine,
+        it gets anchored below.
+    bbox : (x1, y1, x2, y2)
+        Pothole box in the reference image.
+    K : (3, 3)
+        Intrinsics of the reference image (used to project points to pixels).
+    gravity_cam : (3,)
+        Gravity in that camera frame (points down).
+    camera_height_m : float, optional
+        Known camera height. Turns on metric anchoring: because an SfM cloud has
+        no real size, we first fit the road plane, set
+        ``scale = camera_height / (camera-to-plane distance)``, and rescale the
+        cloud. This is what converts SfM units into metres -- no separate scale
+        recovery step is needed.
+    """
+    pts = np.asarray(points_cam, dtype=np.float64).reshape(-1, 3)
+    pts = pts[pts[:, 2] > 1e-6]                      # keep points in front
+    if len(pts) < min_points:
+        return PlaneDepthResult(float("nan"), 0, 0, 0.0,
+                                notes=f"too few 3D points ({len(pts)})")
+
+    proj = (np.asarray(K, dtype=np.float64) @ pts.T).T
+    u = proj[:, 0] / proj[:, 2]
+    v = proj[:, 1] / proj[:, 2]
+
+    x1, y1, x2, y2 = (float(t) for t in bbox)
+    bw, bh = max(1.0, x2 - x1), max(1.0, y2 - y1)
+    in_roi = ((u >= x1 - ring_margin * bw) & (u <= x2 + ring_margin * bw) &
+              (v >= y1 - ring_margin * bh) & (v <= y2 + ring_margin * bh))
+    in_bbox = (u >= x1) & (u <= x2) & (v >= y1) & (v <= y2)
+    in_int = ((u >= x1 + interior_shrink * bw) & (u <= x2 - interior_shrink * bw) &
+              (v >= y1 + interior_shrink * bh) & (v <= y2 - interior_shrink * bh))
+
+    road_pts = pts[in_roi & ~in_bbox]
+    int_pts = pts[in_int]
+
+    # An SfM cloud has arbitrary units, so a metric RANSAC threshold is
+    # meaningless until we rescale. Do a coarse plane fit with a *relative*
+    # threshold, anchor on the camera height, then run the metric fit.
+    prescale = 1.0
+    if camera_height_m is not None and len(road_pts) >= 3:
+        med_norm = float(np.median(np.linalg.norm(road_pts, axis=1)))
+        coarse = fit_plane_ransac(
+            road_pts,
+            dist_thresh=max(1e-9, rel_prescale_thresh * med_norm),
+            iters=300,
+        )
+        if coarse is not None and abs(float(coarse[1])) > 1e-9:
+            prescale = float(camera_height_m) / abs(float(coarse[1]))
+            road_pts = road_pts * prescale
+            int_pts = int_pts * prescale
+
+    res = depth_below_plane(
+        road_pts, int_pts, gravity_cam,
+        dist_thresh=dist_thresh, drop_percentile=drop_percentile,
+        camera_height_m=camera_height_m,
+    )
+    res.notes = f"{res.notes}, prescale={prescale:.4g}"
+    return res

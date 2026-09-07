@@ -86,14 +86,21 @@ class CameraOrientation:
 
 def gravity_vector_from_imu(imu: dict) -> np.ndarray:
     """Extract the gravity vector (g-units) from a misensorkit IMU record."""
-    return np.array(
-        [
-            float(imu["gravity_x_g"]),
-            float(imu["gravity_y_g"]),
-            float(imu["gravity_z_g"]),
-        ],
-        dtype=np.float64,
-    )
+    try:
+        return np.array(
+            [
+                float(imu["gravity_x_g"]),
+                float(imu["gravity_y_g"]),
+                float(imu["gravity_z_g"]),
+            ],
+            dtype=np.float64,
+        )
+    except KeyError as exc:
+        raise KeyError(
+            f"IMU record missing {exc.args[0]!r} "
+            f"(available={imu.get('available', 'unknown')}). "
+            "Frames with available=false should be filtered by the loader."
+        ) from exc
 
 
 def orientation_from_gravity(

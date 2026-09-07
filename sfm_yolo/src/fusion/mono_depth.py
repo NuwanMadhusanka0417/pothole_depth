@@ -24,7 +24,9 @@ from ..utils.logging_utils import get_logger
 
 _logger = get_logger("fusion.mono_depth")
 
-_DEFAULT_MODEL = "depth-anything/Depth-Anything-V2-metric-vkitti-small-hf"
+# Outdoor metric model (fine-tuned on Virtual KITTI); returns depth in metres.
+# Swap to -Base-hf / -Large-hf for more accuracy, or --mono-model on the CLI.
+_DEFAULT_MODEL = "depth-anything/Depth-Anything-V2-Metric-Outdoor-Small-hf"
 
 _INSTALL_HINT = (
     "Monocular metric depth (Path B) needs 'transformers' and 'timm'. "

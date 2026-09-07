@@ -31,6 +31,7 @@ from __future__ import annotations
 import argparse
 import json
 import math
+import re
 import shutil
 import tempfile
 from collections import Counter
@@ -64,7 +65,8 @@ from .geometry.imu_orientation import (
     quarter_turns_to_upright,
     residual_roll_rad,
 )
-from .geometry.plane_depth import pothole_depth_from_depthmap
+from .geometry.plane_depth import pothole_depth_from_depthmap, pothole_depth_from_points
+from .reconstruction.dense_stereo import dense_cloud_from_pair, relative_pose
 from .reconstruction.sfm_runner import SfMRunner
 from .utils.camera_calibration import CameraIntrinsics, load_camera_calibration
 from .utils.data_loader import MendeleyVideoDataset, mask_to_bboxes
@@ -536,6 +538,14 @@ def process_misensorkit(
     roll_warn_deg: float = 10.0,
     depth_method: str = "geometric",
     mono_model: Optional[MetricDepthModel] = None,
+    mono_max_frames: int = 12,
+    mono_roll_gate_deg: float = 8.0,
+    mono_min_bbox_frac: float = 0.01,
+    sfm_max_frames: int = 6,
+    sfm_min_points: int = 30,
+    sfm_min_conf: float = 0.30,
+    sfm_dense: bool = True,
+    save_pointcloud: bool = False,
     save_overlay_video: bool = True,
     save_summary: bool = True,
     every_nth_detect: int = 1,
@@ -637,6 +647,17 @@ def process_misensorkit(
     #    Path B (metric depth + gravity plane fit) gives the true below-plane drop.
     track_results: List[Dict] = []
     mono_depth_cache: Dict[int, np.ndarray] = {}
+
+    # Path A: SfM builds a real 3D model of the pothole from camera motion.
+    # It is fed the UPRIGHT frames, so it uses the rotated intrinsics.
+    sfm_runner: Optional[SfMRunner] = None
+    if depth_method in ("sfm", "both"):
+        sfm_cfg = pipeline_cfg.get("sfm", {}) or {}
+        sfm_runner = SfMRunner(
+            intr,
+            colmap_executable=sfm_cfg.get("colmap_executable", "colmap"),
+            enable_opencv_fallback=True,
+        )
     for tid, track in enumerate(confirmed):
         bboxes: List[Tuple[float, float, float, float]] = []
         pitches: List[float] = []
@@ -666,29 +687,171 @@ def process_misensorkit(
             geo_result.notes = (geo_result.notes + " | " if geo_result.notes else "") + \
                 f"high roll {mean_roll_deg:.1f}deg (pitch-only model)"
 
-        # Path B: metric depth + gravity-oriented road-plane fit -> true drop.
+        # Path B: metric depth + gravity plane fit, aggregated over MANY gated
+        # frames (not one), with per-frame IMU road-plane scale anchoring. This
+        # is what makes the per-pothole depth consistent.
         mono_depth_m = float("nan")
         mono_conf = 0.0
+        mono_std_m = float("nan")
+        mono_n = 0
+        mono_per_frame: List[float] = []
         if mono_model is not None and depth_method in ("monodepth", "both"):
-            ridx = int(np.argmax([(b[2] - b[0]) * (b[3] - b[1]) for b in bboxes]))
-            ref_fi = frame_indices[ridx]
-            ref_bbox = bboxes[ridx]
-            if ref_fi not in mono_depth_cache:
-                mono_depth_cache[ref_fi] = mono_model.infer(frames[ref_fi])
-            g_cam = gravity_camera_frame(
-                gravity_vector_from_imu(ds.frames[ref_fi].imu),
-                camera_axis=axis, k=upright_k,
-            )
-            pres = pothole_depth_from_depthmap(
-                mono_depth_cache[ref_fi], ref_bbox,
-                fx=intr.fx, fy=intr.fy, cx=intr.cx, cy=intr.cy,
-                gravity_cam=g_cam,
-            )
-            mono_depth_m, mono_conf = pres.depth_m, pres.confidence
+            img_area = float(intr.width * intr.height)
+            # (E) Frame gating: keep close/large boxes with small residual roll.
+            cand = []
+            for i, b in enumerate(bboxes):
+                area = (b[2] - b[0]) * (b[3] - b[1])
+                if abs(rolls[i]) <= mono_roll_gate_deg and area >= mono_min_bbox_frac * img_area:
+                    cand.append((area, frame_indices[i], b))
+            if not cand:  # gating too strict -> fall back to all frames
+                cand = [((b[2] - b[0]) * (b[3] - b[1]), frame_indices[i], b)
+                        for i, b in enumerate(bboxes)]
+            cand.sort(reverse=True)                 # largest (closest/clearest) first
+            cand = cand[:mono_max_frames]           # cap inferences (CPU cost)
 
-        # Reported depth per the requested method.
-        if depth_method == "monodepth" and np.isfinite(mono_depth_m):
+            # (A) Aggregate a depth per gated frame, with (C) scale anchoring.
+            for _area, fi, b in cand:
+                if fi not in mono_depth_cache:
+                    mono_depth_cache[fi] = mono_model.infer(frames[fi])
+                g_cam = gravity_camera_frame(
+                    gravity_vector_from_imu(ds.frames[fi].imu),
+                    camera_axis=axis, k=upright_k,
+                )
+                pres = pothole_depth_from_depthmap(
+                    mono_depth_cache[fi], b,
+                    fx=intr.fx, fy=intr.fy, cx=intr.cx, cy=intr.cy,
+                    gravity_cam=g_cam, camera_height_m=camera_height_m,
+                )
+                if np.isfinite(pres.depth_m) and pres.depth_m > 0:
+                    mono_per_frame.append(float(pres.depth_m))
+
+            if mono_per_frame:
+                arr = np.asarray(mono_per_frame, dtype=np.float64)
+                mono_depth_m = float(np.median(arr))
+                mono_std_m = float(np.std(arr))
+                mono_n = int(arr.size)
+                mad = float(np.median(np.abs(arr - mono_depth_m)))
+                # Consistency-based confidence: tight spread -> high confidence.
+                mono_conf = float(np.clip(1.0 / (1.0 + mad / max(mono_depth_m, 1e-6)), 0.0, 1.0))
+
+        # Path A: build a real 3D model of the pothole with SfM, then measure
+        # the drop below the gravity-oriented road plane. The camera height
+        # anchors the arbitrary SfM scale into metres (inside plane_depth).
+        sfm_depth_m = float("nan")
+        sfm_conf = 0.0
+        sfm_n_points = 0
+        sfm_method = ""
+        if sfm_runner is not None:
+            cand = [(frame_indices[i], bboxes[i]) for i in range(len(bboxes))
+                    if abs(rolls[i]) <= mono_roll_gate_deg]
+            if len(cand) < 2:
+                cand = list(zip(frame_indices, bboxes))
+            cand.sort(key=lambda c: c[0])                 # temporal order -> parallax
+            if len(cand) > sfm_max_frames:                # spread evenly over the track
+                sel = np.linspace(0, len(cand) - 1, sfm_max_frames).astype(int)
+                cand = [cand[i] for i in sel]
+
+            if len(cand) >= 2:
+                work_dir = output_dir / f"track_{tid:03d}_sfm" if save_pointcloud else \
+                    Path(tempfile.mkdtemp(prefix=f"track_{tid:03d}_sfm_"))
+                try:
+                    sfm_res = sfm_runner.run_from_frames(
+                        [frames[fi] for fi, _ in cand], work_dir=work_dir,
+                    )
+                    if sfm_res.poses and sfm_res.num_points > 0:
+                        # Reference = the first *registered* pose. Its name is
+                        # frame_XXXX, which indexes back into `cand` (COLMAP may
+                        # not register every frame, so never assume cand[0]).
+                        ref = sfm_res.poses[0]
+                        m = re.search(r"frame_(\d+)", ref.name)
+                        ref_idx = min(int(m.group(1)), len(cand) - 1) if m else 0
+                        ref_fi, ref_bbox = cand[ref_idx]
+                        cam_pts = (ref.R @ sfm_res.points_3d.T).T + ref.t
+                        sfm_cloud = "sparse"
+
+                        # Densify: SfM's sparse cloud has too few points inside
+                        # the hole. Triangulate every pixel of the pothole region
+                        # against the widest-baseline partner frame.
+                        if sfm_dense and len(sfm_res.poses) >= 2:
+                            K_mat = sfm_res.K if sfm_res.K is not None else intr.K()
+                            # Partner choice is a trade-off: a wide baseline
+                            # triangulates better, but dense flow breaks down on
+                            # large motion. Take the MEDIAN baseline as a
+                            # compromise rather than the widest.
+                            options = []
+                            for p in sfm_res.poses[1:]:
+                                R_rel, t_rel = relative_pose(ref.R, ref.t, p.R, p.t)
+                                options.append((float(np.linalg.norm(t_rel)), p, R_rel, t_rel))
+                            options.sort(key=lambda o: o[0])
+                            best = options[len(options) // 2] if options else None
+                            if best is not None:
+                                _base, p_other, R_rel, t_rel = best
+                                mo = re.search(r"frame_(\d+)", p_other.name)
+                                oi = min(int(mo.group(1)), len(cand) - 1) if mo else -1
+                                bw = ref_bbox[2] - ref_bbox[0]
+                                bh = ref_bbox[3] - ref_bbox[1]
+                                roi = (ref_bbox[0] - 0.6 * bw, ref_bbox[1] - 0.6 * bh,
+                                       ref_bbox[2] + 0.6 * bw, ref_bbox[3] + 0.6 * bh)
+                                dense_pts = dense_cloud_from_pair(
+                                    frames[ref_fi], frames[cand[oi][0]],
+                                    K_mat, R_rel, t_rel, roi=roi,
+                                )
+                                # Prefer the dense cloud on its own merit: the
+                                # sparse cloud covers the whole scene, so
+                                # comparing raw counts would wrongly reject it.
+                                if len(dense_pts) >= sfm_min_points:
+                                    cam_pts = dense_pts
+                                    sfm_cloud = "dense-flow"
+                                _logger.info(
+                                    "Track %d: dense stereo gave %d points (baseline=%.3f)",
+                                    tid, len(dense_pts), _base,
+                                )
+
+                        g_cam = gravity_camera_frame(
+                            gravity_vector_from_imu(ds.frames[ref_fi].imu),
+                            camera_axis=axis, k=upright_k,
+                        )
+                        pres = pothole_depth_from_points(
+                            cam_pts, ref_bbox,
+                            K=sfm_res.K if sfm_res.K is not None else intr.K(),
+                            gravity_cam=g_cam, camera_height_m=camera_height_m,
+                        )
+                        sfm_depth_m = pres.depth_m
+                        sfm_conf = pres.confidence
+                        sfm_n_points = pres.n_interior_points
+                        sfm_method = f"{sfm_res.method}/{sfm_cloud}"
+                        if save_pointcloud:
+                            sfm_res.save_ply(output_dir / f"track_{tid:03d}.ply")
+                except Exception as exc:  # pragma: no cover - env dependent
+                    _logger.warning("SfM failed for track %d: %s", tid, exc)
+                finally:
+                    if not save_pointcloud:
+                        shutil.rmtree(work_dir, ignore_errors=True)
+
+        # Pick the best available 3D estimate. A sparse SfM cloud (e.g. the
+        # OpenCV two-view fallback when COLMAP is missing) can have only a
+        # handful of points inside the hole, which is not enough to measure a
+        # few-centimetre drop -- so SfM is only trusted when it clears a
+        # density/confidence gate. Otherwise the dense Path B cloud wins.
+        sfm_ok = (
+            np.isfinite(sfm_depth_m)
+            and sfm_n_points >= sfm_min_points
+            and sfm_conf >= sfm_min_conf
+        )
+        if np.isfinite(sfm_depth_m) and not sfm_ok:
+            _logger.warning(
+                "Track %d: SfM 3D cloud too sparse/uncertain (%d interior points, "
+                "conf=%.2f) - not trusted. Install COLMAP for a dense reconstruction.",
+                tid, sfm_n_points, sfm_conf,
+            )
+
+        if sfm_ok:
+            primary_depth, primary_conf, primary_name = sfm_depth_m, sfm_conf, "sfm-3d-plane"
+        elif np.isfinite(mono_depth_m):
             primary_depth, primary_conf, primary_name = mono_depth_m, mono_conf, "monodepth-plane"
+        elif depth_method == "sfm" and np.isfinite(sfm_depth_m):
+            # SfM-only mode: report it even below the gate (flagged low confidence).
+            primary_depth, primary_conf, primary_name = sfm_depth_m, sfm_conf, "sfm-3d-plane(low)"
         else:
             primary_depth, primary_conf, primary_name = \
                 geo_result.depth_m, geo_result.confidence, "geometric-bbox"
@@ -711,17 +874,27 @@ def process_misensorkit(
             "geometric_bbox_depth_m": geo_result.depth_m,
             "monodepth_plane_depth_m": mono_depth_m,
             "monodepth_confidence": mono_conf,
+            "monodepth_std_m": mono_std_m,
+            "monodepth_n_frames": mono_n,
+            "sfm_3d_depth_m": sfm_depth_m,
+            "sfm_confidence": sfm_conf,
+            "sfm_interior_points": sfm_n_points,
+            "sfm_method": sfm_method,
             "result": result_dict,
         }
-        if depth_method == "both" and np.isfinite(mono_depth_m):
-            entry["path_a_vs_b"] = compare_pair(geo_result.depth_m, mono_depth_m).as_dict()
+        # Path A (SfM 3D) validated against Path B (learned depth).
+        if depth_method == "both" and np.isfinite(sfm_depth_m) and np.isfinite(mono_depth_m):
+            entry["path_a_vs_b"] = compare_pair(sfm_depth_m, mono_depth_m).as_dict()
         track_results.append(entry)
 
         _logger.info(
-            "Track %d: %s depth=%.1f cm conf=%.2f (n=%d, pitch~%.1f deg)%s",
+            "Track %d: %s depth=%.1f cm conf=%.2f (n=%d, pitch~%.1f deg)%s%s",
             tid, primary_name, primary_depth * 100.0, primary_conf, len(bboxes),
             float(np.degrees(np.mean(pitches))),
-            (f" | monodepth={mono_depth_m * 100.0:.1f} cm" if np.isfinite(mono_depth_m) else ""),
+            (f" | sfm={sfm_depth_m * 100.0:.1f} cm ({sfm_method}, {sfm_n_points} pts)"
+             if np.isfinite(sfm_depth_m) else ""),
+            (f" | monodepth={mono_depth_m * 100.0:.1f}+/-{mono_std_m * 100.0:.1f} cm"
+             if np.isfinite(mono_depth_m) else ""),
         )
 
     summary = {
@@ -958,14 +1131,27 @@ def main() -> None:
                             "IMU optical-axis convention). Default: rear.")
     p_imu.add_argument("--pitch-offset-deg", type=float, default=0.0,
                        help="Constant pitch correction for mounting/convention bias.")
-    p_imu.add_argument("--depth-method", choices=("geometric", "monodepth", "both"),
-                       default="geometric",
-                       help="geometric = bbox bound (fast, inaccurate); monodepth = "
-                            "metric depth + gravity plane fit (Path B); both = compute "
-                            "both and record the A-vs-B comparison.")
+    p_imu.add_argument("--depth-method", choices=("geometric", "monodepth", "sfm", "both"),
+                       default="sfm",
+                       help="sfm = SfM 3D model + gravity plane fit (Path A, most "
+                            "accurate, default); monodepth = learned metric depth + "
+                            "plane fit (Path B); geometric = bbox bound (inaccurate); "
+                            "both = Path A + Path B with an A-vs-B comparison.")
+    p_imu.add_argument("--sfm-max-frames", type=int, default=6,
+                       help="Frames per pothole fed to SfM (spread over the track for "
+                            "parallax).")
+    p_imu.add_argument("--save-pointcloud", action="store_true",
+                       help="Write the SfM 3D model per pothole as track_XXX.ply")
+    p_imu.add_argument("--no-dense-stereo", action="store_true",
+                       help="Disable CPU dense stereo (use SfM's sparse cloud only). "
+                            "Dense stereo triangulates every pixel of the pothole "
+                            "region and is normally what makes Path A usable.")
     p_imu.add_argument("--mono-model", default=None,
                        help="HuggingFace metric depth model id (Path B). Defaults to "
                             "DepthAnything V2 metric.")
+    p_imu.add_argument("--mono-max-frames", type=int, default=12,
+                       help="Max frames per pothole to run Path B on (aggregated by "
+                            "median). Higher = more stable but slower on CPU.")
     p_imu.add_argument("--config", default="sfm_yolo/configs/pipeline.yaml")
     p_imu.add_argument("--weights", default=None, help="Override YOLO weights path")
     p_imu.add_argument("--no-overlay", action="store_true", help="Disable overlay video")
@@ -1001,6 +1187,10 @@ def main() -> None:
             pitch_offset_deg=args.pitch_offset_deg,
             depth_method=args.depth_method,
             mono_model=mono_model,
+            mono_max_frames=args.mono_max_frames,
+            sfm_max_frames=args.sfm_max_frames,
+            sfm_dense=not args.no_dense_stereo,
+            save_pointcloud=args.save_pointcloud,
             save_overlay_video=not args.no_overlay,
             save_summary=True,
         )

@@ -167,8 +167,17 @@ class SfMRunner:
         try:
             image_paths = self._save_frames(frames, work_dir / "images")
 
+            # Preference order: pycolmap (in-process COLMAP, dense multi-view)
+            # -> colmap CLI -> OpenCV two-view fallback (sparse, last resort).
+            if self._pycolmap_available():
+                _logger.info("Running pycolmap on %d images", len(image_paths))
+                try:
+                    return self._run_pycolmap(image_paths, work_dir)
+                except Exception as exc:  # pragma: no cover - depends on env
+                    _logger.warning("pycolmap failed (%s); trying next backend", exc)
+
             if self._colmap_available():
-                _logger.info("Running COLMAP on %d images", len(image_paths))
+                _logger.info("Running COLMAP CLI on %d images", len(image_paths))
                 try:
                     return self._run_colmap(image_paths, work_dir)
                 except Exception as exc:  # pragma: no cover - depends on env
@@ -265,6 +274,102 @@ class SfMRunner:
             return True
         # Allow absolute paths even if not in PATH
         return Path(self.colmap_executable).is_file()
+
+    # ------------------------------------------------------------------
+    # pycolmap backend (in-process COLMAP; no CLI binary needed)
+    # ------------------------------------------------------------------
+    @staticmethod
+    def _pycolmap_available() -> bool:
+        import importlib.util
+        return importlib.util.find_spec("pycolmap") is not None
+
+    def _run_pycolmap(self, image_paths: List[Path], work_dir: Path) -> SfMResult:
+        """Full incremental SfM via the pycolmap bindings.
+
+        Unlike the two-view OpenCV fallback this registers *all* frames and
+        triangulates a much denser cloud, which is what the pothole floor needs.
+        We hand COLMAP the known camera intrinsics so it does not re-solve them.
+        """
+        import pycolmap
+
+        image_dir = image_paths[0].parent
+        db_path = work_dir / "database.db"
+        if db_path.exists():
+            db_path.unlink()
+        sparse_dir = work_dir / "sparse"
+        sparse_dir.mkdir(parents=True, exist_ok=True)
+
+        reader = pycolmap.ImageReaderOptions()
+        reader.camera_model = "PINHOLE"
+        reader.camera_params = (
+            f"{self.intrinsics.fx},{self.intrinsics.fy},"
+            f"{self.intrinsics.cx},{self.intrinsics.cy}"
+        )
+
+        pycolmap.extract_features(
+            db_path,
+            image_dir,
+            camera_mode=pycolmap.CameraMode.SINGLE,
+            reader_options=reader,
+        )
+        pycolmap.match_exhaustive(db_path)
+        recs = pycolmap.incremental_mapping(db_path, image_dir, sparse_dir)
+        if not recs:
+            raise RuntimeError("pycolmap produced no reconstruction")
+
+        rec = max(recs.values(), key=lambda r: r.num_points3D())
+        if rec.num_points3D() == 0:
+            raise RuntimeError("pycolmap reconstruction has no 3D points")
+
+        pts: List[np.ndarray] = []
+        cols: List[np.ndarray] = []
+        for p in rec.points3D.values():
+            pts.append(np.asarray(p.xyz, dtype=np.float64))
+            cols.append(np.asarray(p.color, dtype=np.uint8))
+        points_3d = np.asarray(pts, dtype=np.float64)
+        colors = np.asarray(cols, dtype=np.uint8) if cols else None
+
+        poses: List[CameraPose] = []
+        for img in rec.images.values():
+            has_pose = img.has_pose
+            if callable(has_pose):
+                has_pose = has_pose()
+            if not has_pose:
+                continue
+            # pycolmap 4.x exposes cam_from_world as a method; older versions
+            # expose it as a property.
+            cfw = img.cam_from_world
+            if callable(cfw):
+                cfw = cfw()
+            R = np.asarray(cfw.rotation.matrix(), dtype=np.float64)
+            t = np.asarray(cfw.translation, dtype=np.float64).reshape(3)
+            poses.append(
+                CameraPose(image_id=int(img.image_id), name=str(img.name), R=R, t=t)
+            )
+        if not poses:
+            raise RuntimeError("pycolmap registered no camera poses")
+        # Names are frame_0000.jpg, frame_0001.jpg, ... so sorting by name puts
+        # them back in the order the caller supplied.
+        poses.sort(key=lambda p: p.name)
+
+        img0 = cv2.imread(str(image_paths[0]))
+        image_size = (img0.shape[1], img0.shape[0]) if img0 is not None else None
+        K_mat = self._scaled_K_for_image(img0) if img0 is not None else self.intrinsics.K()
+
+        n_reg = rec.num_reg_images()
+        if callable(n_reg):  # pragma: no cover - version guard
+            n_reg = n_reg()
+        return SfMResult(
+            points_3d=points_3d,
+            point_colors=colors,
+            poses=poses,
+            K=K_mat,
+            image_paths=list(image_paths),
+            image_size=image_size,
+            method="pycolmap",
+            notes=(f"reconstructions={len(recs)}, reg_images={n_reg}/{len(image_paths)}, "
+                   f"points={len(points_3d)}"),
+        )
 
     def _run_colmap(self, image_paths: List[Path], work_dir: Path) -> SfMResult:
         db_path = work_dir / "database.db"
