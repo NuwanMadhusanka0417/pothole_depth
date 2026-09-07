@@ -1,0 +1,16 @@
+backend: opencv  # opencv | colmap | vggt
+min_feature_matches: 30
+min_inlier_ratio: 0.35
+min_parallax_deg: 0.5
+max_reprojection_error: 2.0
+feature_detector: orb  # orb | sift
+max_features: 2000
+ransac_threshold: 1.0
+
+colmap:
+  executable: colmap
+  workspace: data/output/colmap
+
+vggt:
+  checkpoint: null
+  device: cuda

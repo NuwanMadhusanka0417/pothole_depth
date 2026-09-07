@@ -1,0 +1,78 @@
+video:
+  frame_stride: 1
+  max_frames: null
+  start_frame: 0
+  duration_seconds: null
+
+paths:
+  output_dir: data/output
+  events_dir: data/events
+  cache_dir: data/output/cache
+  models_dir: data/models
+  calibration_dir: data/calibration
+
+roi:
+  config_file: configs/roi.yaml
+
+quality:
+  min_sharpness: 50.0
+  max_blur_score: 0.65
+  min_brightness: 30.0
+  max_brightness: 230.0
+  min_contrast: 15.0
+  max_saturation_clip_ratio: 0.15
+  min_pothole_pixels: 100
+  min_visible_ratio: 0.5
+
+zones:
+  detection_start_y: 0.64
+  tracking_start_y: 0.69
+  depth_start_y: 0.74
+  depth_end_y: 0.88
+
+detection:
+  config_file: configs/detection.yaml
+
+tracking:
+  max_age: 30
+  min_track_frames: 5
+  min_frames_for_depth: 10
+  max_best_frames: 20
+  iou_threshold: 0.15
+  centroid_max_distance: 150.0
+
+depth:
+  config_file: configs/depth.yaml
+
+reconstruction:
+  config_file: configs/reconstruction.yaml
+
+road_surface:
+  model: auto  # plane | quadratic | auto
+  ring_width_pixels: 40
+  ransac_threshold: 0.02
+  min_road_points: 50
+
+measurement:
+  deepest_percentile: 97.5
+  deepest_region_fraction: 0.03
+  min_pothole_pixels: 200
+
+confidence:
+  metric_accept: 0.85
+  approximate_accept: 0.65
+
+camera:
+  config_file: configs/camera.yaml
+  require_calibration: false
+
+dynamic_objects:
+  enabled: true
+  classes: [car, truck, bus, motorcycle, bicycle, person]
+
+logging:
+  level: INFO
+
+pipeline:
+  cache_enabled: true
+  debug: false

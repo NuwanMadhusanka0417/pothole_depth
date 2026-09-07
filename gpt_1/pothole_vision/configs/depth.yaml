@@ -1,0 +1,18 @@
+backend: fallback  # fallback | video_depth_anything | single_frame_metric
+metric_required: false
+temporal_frames: 16
+fusion_weights:
+  reprojection: 0.3
+  metric_depth: 0.3
+  road_surface: 0.2
+  temporal: 0.2
+
+video_depth_anything:
+  model_size: vitl
+  checkpoint: null
+
+single_frame:
+  model_name: depth-anything-v2
+
+fallback:
+  use_midas: false
