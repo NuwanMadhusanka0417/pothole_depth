@@ -1,0 +1,25 @@
+depth:
+  backend: single_frame  # video_depth_anything | single_frame | none
+  metric_required: false
+  temporal_frames: 16
+  fusion_weights:
+    reprojection: 1.0
+    metric_depth: 0.8
+    road_surface: 0.5
+    temporal: 0.6
+
+scale_estimation:
+  method: robust_median
+  mad_threshold: 3.5
+  min_points: 50
+  exclude_pothole_pixels: true
+
+video_depth_anything:
+  model_name: depth-anything/Video-Depth-Anything-Small
+  install_note: >
+    Optional backend. Clone https://github.com/DepthAnything/Video-Depth-Anything
+    and set depth.backend=video_depth_anything in config.
+
+single_frame:
+  model_name: depth-anything/Depth-Anything-V2-Small-hf
+  is_metric: false
