@@ -12,8 +12,10 @@ import numpy as np
 from _bootstrap import PROJECT_ROOT
 import _bootstrap  # noqa: F401
 
-from pothole_vision.geometry.coordinates import pixel_to_normalized
+from cli_videos import add_video_input_args, resolve_videos
+
 from pothole_vision.roi.fixed_roi import ROIConfig, load_roi_config, save_roi_config
+from pothole_vision.utils.config import load_config, resolve_path
 from pothole_vision.video.reader import VideoReader
 
 
@@ -60,15 +62,22 @@ class ROIConfigurator:
 
 def main() -> None:
     parser = argparse.ArgumentParser(description="Configure normalized road ROI")
-    parser.add_argument("--video", required=True, type=Path)
+    add_video_input_args(parser)
+    parser.add_argument("--config", default="configs/default.yaml", type=Path)
     parser.add_argument("--output", default="configs/roi.yaml", type=Path)
     parser.add_argument("--frame", type=int, default=0)
     args = parser.parse_args()
 
+    config = load_config(resolve_path(PROJECT_ROOT, str(args.config)), PROJECT_ROOT)
+    videos = resolve_videos(args, config)
+    video_path = videos[0]
+    if len(videos) > 1:
+        print(f"Using first of {len(videos)} videos: {video_path.name}")
+
     output_path = args.output if args.output.is_absolute() else PROJECT_ROOT / args.output
     existing = load_roi_config(output_path) if output_path.exists() else None
 
-    with VideoReader(args.video) as reader:
+    with VideoReader(video_path) as reader:
         frame = reader.read_frame(args.frame)
         if frame is None:
             raise RuntimeError(f"Cannot read frame {args.frame}")

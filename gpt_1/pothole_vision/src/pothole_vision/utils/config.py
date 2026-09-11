@@ -17,6 +17,8 @@ class VideoConfig(BaseModel):
 
 
 class PathsConfig(BaseModel):
+    input_dir: str = "data/input"
+    input_glob: str | None = None
     output_dir: str = "data/output"
     events_dir: str = "data/events"
     cache_dir: str = "data/output/cache"

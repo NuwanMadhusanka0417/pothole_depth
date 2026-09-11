@@ -9,6 +9,8 @@ from pathlib import Path
 from _bootstrap import PROJECT_ROOT
 import _bootstrap  # noqa: F401
 
+from cli_videos import add_video_input_args, apply_output_dir_override, resolve_videos
+
 from pothole_vision.pipeline.pipeline import PotholePipeline
 from pothole_vision.pipeline.stages import PipelineMode
 from pothole_vision.utils.config import load_config, resolve_path
@@ -16,7 +18,7 @@ from pothole_vision.utils.config import load_config, resolve_path
 
 def main() -> None:
     parser = argparse.ArgumentParser(description="Pothole Vision pipeline")
-    parser.add_argument("--video", required=True, type=Path, help="Input MP4 video")
+    add_video_input_args(parser)
     parser.add_argument("--config", default="configs/default.yaml", type=Path)
     parser.add_argument("--mode", default="detection",
                         choices=["detection", "tracking", "geometry", "full"])
@@ -35,8 +37,12 @@ def main() -> None:
     }
 
     config = load_config(resolve_path(PROJECT_ROOT, str(args.config)), PROJECT_ROOT)
+    apply_output_dir_override(config, args.output_dir, PROJECT_ROOT)
     if args.debug:
         config.pipeline.debug = True
+
+    videos = resolve_videos(args, config)
+    print(f"Processing {len(videos)} video(s)")
 
     pipeline = PotholePipeline(
         config, PROJECT_ROOT,
@@ -44,15 +50,20 @@ def main() -> None:
         debug=args.debug,
         force=args.force,
     )
-    result = pipeline.run(
-        args.video,
-        start_frame=args.start,
-        duration=args.duration,
-        max_frames=args.max_frames,
-    )
+
+    results = []
+    for video_path in videos:
+        result = pipeline.run(
+            video_path,
+            start_frame=args.start,
+            duration=args.duration,
+            max_frames=args.max_frames,
+        )
+        results.append(result)
+
     print("\n=== Pipeline Complete ===")
-    for k, v in result.items():
-        print(f"  {k}: {v}")
+    for result in results:
+        print(f"  {result['video_id']}: detections={result['detections']}, out={result['output_dir']}")
 
 
 if __name__ == "__main__":

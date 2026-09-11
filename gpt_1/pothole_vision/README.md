@@ -78,28 +78,52 @@ pothole_vision/
 
 ## Quick Start
 
-### 1. Link or copy dashcam video
-
-Videos from the parent project are at `../../data/dashcam/`:
-
+### NCI command
 ```bash
-# Windows (PowerShell) — symlink example
-New-Item -ItemType SymbolicLink -Path "data\input\dashcam.mp4" -Target "..\..\data\dashcam\20260725_120804_NF.mp4"
+module avail python
+module avail python3
+module avail intel-python
 
-# Or copy
-copy "..\..\data\dashcam\20260725_120804_NF.mp4" "data\input\dashcam.mp4"
+cd /scratch/mi23/nuwan/pothole/pothole_depth/gpt_1/pothole_vision
+module load python3/3.9.2
+source /scratch/jq77/nk8155/seg/bin/activate
 ```
 
-### 2. Inspect video
+### 1. Place videos in `data/input/`
+
+Put one or more dashcam `.mp4` files in `data/input/` (no fixed filename required).
 
 ```bash
-python scripts/inspect_video.py --video data/input/dashcam.mp4
+# Example: copy from project dashcam folder
+cp ../../data/dashcam/*.mp4 data/input/
+ls data/input/
 ```
+
+Paths in config: `paths.input_dir` and optional `paths.input_glob` in `configs/default.yaml`.
+
+### 2. Inspect video(s)
+
+```bash
+# All videos in data/input/
+python scripts/inspect_video.py
+
+# One file
+python scripts/inspect_video.py --video data/input/20260725_120804_NF.mp4
+
+# Explicit folder
+python scripts/inspect_video.py --input-dir data/input
+```
+
+Run commands from the `pothole_vision` project root so relative paths resolve correctly.
 
 ### 3. Configure ROI (recommended)
 
+Uses the first video in `data/input/` if you omit `--video`:
+
 ```bash
-python scripts/configure_roi.py --video data/input/dashcam.mp4
+python scripts/configure_roi.py --video data/input/20260725_120804_NF.mp4
+# or
+python scripts/configure_roi.py
 ```
 
 Click polygon vertices on a representative frame. Press `s` to save normalized coordinates to `configs/roi.yaml`.
@@ -107,30 +131,39 @@ Click polygon vertices on a representative frame. Press `s` to save normalized c
 ### 4. Run detection pipeline (Milestone 1)
 
 ```bash
-python scripts/run_pipeline.py --video data/input/dashcam.mp4 --mode detection --debug
+# Process every .mp4 in data/input/
+python scripts/run_pipeline.py --mode detection --debug
+
+# Single video
+python scripts/run_pipeline.py --video data/input/20260725_120804_NF.mp4 --mode detection --debug
+
+# Custom output base folder (per-video subfolders created inside)
+python scripts/run_pipeline.py --input-dir data/input --output-dir data/output --mode detection
 ```
 
-**Outputs:**
-- `data/output/annotated.mp4`
-- `data/output/detections.json`
-- `data/output/roi_debug.jpg`
+**Outputs (per video `<stem>`):**
+- `data/output/<stem>/annotated.mp4`
+- `data/output/<stem>/detections.json`
+- `data/output/<stem>/roi_debug.jpg` (with `--debug`)
+- `data/events/<stem>/PH_.../` (tracking/full modes)
+- `data/output/cache/<stem>/` (cached intermediates)
 
 ### 5. Run tracking (Milestone 2)
 
 ```bash
-python scripts/run_pipeline.py --video data/input/dashcam.mp4 --mode tracking
+python scripts/run_pipeline.py --mode tracking
 ```
 
 ### 6. Run geometry (Milestone 3)
 
 ```bash
-python scripts/run_pipeline.py --video data/input/dashcam.mp4 --mode geometry --debug
+python scripts/run_pipeline.py --mode geometry --debug
 ```
 
 ### 7. Limit processing for testing
 
 ```bash
-python scripts/run_pipeline.py --video data/input/dashcam.mp4 --mode detection --start 30 --duration 20 --max-frames 600
+python scripts/run_pipeline.py --video data/input/20260725_120804_NF.mp4 --mode detection --start 30 --duration 20 --max-frames 600
 ```
 
 ## Camera Calibration

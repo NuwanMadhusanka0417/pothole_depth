@@ -5,6 +5,8 @@ video:
   duration_seconds: null
 
 paths:
+  input_dir: data/input
+  input_glob: null
   output_dir: data/output
   events_dir: data/events
   cache_dir: data/output/cache

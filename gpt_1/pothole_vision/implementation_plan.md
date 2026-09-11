@@ -118,5 +118,5 @@ Optional: Video Depth Anything, COLMAP, VGGT — installed separately; adapters 
 
 ## Data Layout
 
-Place dashcam videos in `data/input/` or reference `../../data/dashcam/` from project root.
-Default test video symlink/copy: `data/input/dashcam.mp4`.
+Place one or more `.mp4` files in `data/input/`. Run without `--video` to process all files.
+Outputs land in `data/output/<video_stem>/` and `data/events/<video_stem>/`.

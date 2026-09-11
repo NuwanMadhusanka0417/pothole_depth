@@ -29,6 +29,7 @@ from pothole_vision.storage.event_writer import EventWriter
 from pothole_vision.storage.results import save_detections_json, save_tracks_json
 from pothole_vision.tracking.tracker import PotholeTracker
 from pothole_vision.utils.config import AppConfig, load_config, load_nested_config, resolve_path
+from pothole_vision.utils.video_paths import paths_for_video, resolve_video_path
 from pothole_vision.utils.logging import log_stage, setup_logging
 from pothole_vision.video.reader import VideoReader
 from pothole_vision.visualization.overlay import draw_detection, draw_roi_polygon, draw_zone_lines
@@ -68,10 +69,10 @@ class PotholePipeline:
         cam_path = resolve_path(self.root, config.camera.config_file)
         self.camera = Camera(load_camera_intrinsics(cam_path))
 
-        self.output_dir = resolve_path(self.root, config.paths.output_dir)
-        self.events_dir = resolve_path(self.root, config.paths.events_dir)
-        self.cache_dir = resolve_path(self.root, config.paths.cache_dir)
-        self.output_dir.mkdir(parents=True, exist_ok=True)
+        self.base_output_dir = resolve_path(self.root, config.paths.output_dir)
+        self.base_events_dir = resolve_path(self.root, config.paths.events_dir)
+        self.base_cache_dir = resolve_path(self.root, config.paths.cache_dir)
+        self.base_output_dir.mkdir(parents=True, exist_ok=True)
 
     def run(
         self,
@@ -80,9 +81,25 @@ class PotholePipeline:
         duration: float | None = None,
         max_frames: int | None = None,
     ) -> dict[str, Any]:
-        video_path = Path(video_path)
-        video_id = video_path.stem
-        cache_path = self.cache_dir / video_id
+        video_path = resolve_video_path(video_path, self.root)
+        if not video_path.is_file():
+            raise FileNotFoundError(f"Video not found: {video_path}")
+
+        run_paths = paths_for_video(
+            video_path,
+            self.base_output_dir,
+            self.base_events_dir,
+            self.base_cache_dir,
+        )
+        self.output_dir = run_paths.output_dir
+        self.events_dir = run_paths.events_dir
+        self.cache_dir = run_paths.cache_dir
+        self.output_dir.mkdir(parents=True, exist_ok=True)
+        self.events_dir.mkdir(parents=True, exist_ok=True)
+        self.cache_dir.mkdir(parents=True, exist_ok=True)
+
+        video_id = run_paths.video_id
+        log_stage("VIDEO", f"processing {video_path.name} -> output/{video_id}/")
 
         with VideoReader(video_path) as reader:
             meta = reader.metadata
@@ -112,7 +129,7 @@ class PotholePipeline:
 
             all_detections: list[dict] = []
             track_map: dict[str, Any] = {}
-            annotated_path = self.output_dir / "annotated.mp4"
+            annotated_path = run_paths.annotated_video
             writer = cv2.VideoWriter(
                 str(annotated_path),
                 cv2.VideoWriter_fourcc(*"mp4v"),
@@ -190,6 +207,8 @@ class PotholePipeline:
 
             return {
                 "video": str(video_path),
+                "video_id": video_id,
+                "output_dir": str(self.output_dir),
                 "detections": len(all_detections),
                 "tracks": len(tracker.all_tracks) if tracker else 0,
                 "annotated_video": str(annotated_path),
