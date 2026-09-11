@@ -25,6 +25,7 @@ qsub -I -q gpuhopper -l ncpus=12,mem=64GB,ngpus=1,walltime=12:00:00 -P mi23 -l s
 
 ```bash
 module load cuda
+module load ffmpeg
 module load python3/3.9.2
 source /scratch/jq77/nk8155/seg/bin/activate
 cd /scratch/mi23/nuwan/pothole/pothole_depth/gpt_1/pothole_vision

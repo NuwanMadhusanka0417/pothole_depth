@@ -12,6 +12,30 @@ import numpy as np
 from pothole_vision.video.quality import FrameQuality, assess_frame_quality
 
 
+def open_video_capture(path: Path) -> cv2.VideoCapture:
+    """
+    Open a video file for decoding.
+
+    Prefer FFmpeg backend (handles many MP4/H.264 + MP3/AAC dashcam containers).
+    Fall back to OpenCV default if FFmpeg cannot open the file.
+    """
+    path_str = str(path)
+    cap = cv2.VideoCapture(path_str, cv2.CAP_FFMPEG)
+    if cap.isOpened():
+        return cap
+
+    cap.release()
+    cap = cv2.VideoCapture(path_str)
+    if cap.isOpened():
+        return cap
+
+    cap.release()
+    raise RuntimeError(
+        f"Cannot open video: {path}. "
+        "Try: module load ffmpeg (Gadi), or re-mux with ffmpeg -c copy / -c:v libx264 -c:a aac."
+    )
+
+
 @dataclass
 class FrameData:
     frame_index: int
@@ -44,10 +68,14 @@ class VideoReader:
         self.path = Path(video_path)
         if not self.path.exists():
             raise FileNotFoundError(f"Video not found: {self.path}")
-        self._cap = cv2.VideoCapture(str(self.path))
-        if not self._cap.isOpened():
-            raise RuntimeError(f"Cannot open video: {self.path}")
+        self._cap = open_video_capture(self.path)
         self.metadata = self._read_metadata()
+        if self.metadata.width <= 0 or self.metadata.height <= 0:
+            self.close()
+            raise RuntimeError(
+                f"Video opened but invalid dimensions for {self.path}. "
+                "File may be corrupt or use an unsupported codec."
+            )
 
     def _read_metadata(self) -> VideoMetadata:
         width = int(self._cap.get(cv2.CAP_PROP_FRAME_WIDTH))
