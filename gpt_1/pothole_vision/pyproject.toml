@@ -7,7 +7,7 @@ name = "pothole-vision"
 version = "0.1.0"
 description = "Monocular dashcam pothole detection, tracking, and 3D measurement"
 readme = "README.md"
-requires-python = ">=3.11"
+requires-python = ">=3.9"
 license = { text = "MIT" }
 authors = [{ name = "Pothole Vision Team" }]
 dependencies = [

@@ -28,6 +28,14 @@ module load cuda
 module load python3/3.9.2
 source /scratch/jq77/nk8155/seg/bin/activate
 cd /scratch/mi23/nuwan/pothole/pothole_depth/gpt_1/pothole_vision
+pip install -r requirements.txt
+```
+
+Inspect all videos in `data/input/`:
+
+```bash
+python scripts/inspect_video.py
+python scripts/run_pipeline.py --mode detection
 ```
 
 

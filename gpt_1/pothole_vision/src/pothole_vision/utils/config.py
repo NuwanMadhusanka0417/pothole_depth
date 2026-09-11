@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from pathlib import Path
-from typing import Any
+from typing import Any, Dict, List, Optional, Union
 
 import yaml
 from pydantic import BaseModel, Field
@@ -11,14 +11,14 @@ from pydantic import BaseModel, Field
 
 class VideoConfig(BaseModel):
     frame_stride: int = 1
-    max_frames: int | None = None
+    max_frames: Optional[int] = None
     start_frame: int = 0
-    duration_seconds: float | None = None
+    duration_seconds: Optional[float] = None
 
 
 class PathsConfig(BaseModel):
     input_dir: str = "data/input"
-    input_glob: str | None = None
+    input_glob: Optional[str] = None
     output_dir: str = "data/output"
     events_dir: str = "data/events"
     cache_dir: str = "data/output/cache"
@@ -78,7 +78,7 @@ class CameraRefConfig(BaseModel):
 
 class DynamicObjectsConfig(BaseModel):
     enabled: bool = True
-    classes: list[str] = Field(default_factory=lambda: [
+    classes: List[str] = Field(default_factory=lambda: [
         "car", "truck", "bus", "motorcycle", "bicycle", "person"
     ])
 
@@ -95,13 +95,13 @@ class PipelineConfig(BaseModel):
 class AppConfig(BaseModel):
     video: VideoConfig = Field(default_factory=VideoConfig)
     paths: PathsConfig = Field(default_factory=PathsConfig)
-    roi: dict[str, Any] = Field(default_factory=lambda: {"config_file": "configs/roi.yaml"})
+    roi: Dict[str, Any] = Field(default_factory=lambda: {"config_file": "configs/roi.yaml"})
     quality: QualityConfig = Field(default_factory=QualityConfig)
     zones: ZonesConfig = Field(default_factory=ZonesConfig)
-    detection: dict[str, Any] = Field(default_factory=lambda: {"config_file": "configs/detection.yaml"})
+    detection: Dict[str, Any] = Field(default_factory=lambda: {"config_file": "configs/detection.yaml"})
     tracking: TrackingConfig = Field(default_factory=TrackingConfig)
-    depth: dict[str, Any] = Field(default_factory=lambda: {"config_file": "configs/depth.yaml"})
-    reconstruction: dict[str, Any] = Field(default_factory=lambda: {"config_file": "configs/reconstruction.yaml"})
+    depth: Dict[str, Any] = Field(default_factory=lambda: {"config_file": "configs/depth.yaml"})
+    reconstruction: Dict[str, Any] = Field(default_factory=lambda: {"config_file": "configs/reconstruction.yaml"})
     road_surface: RoadSurfaceConfig = Field(default_factory=RoadSurfaceConfig)
     measurement: MeasurementConfig = Field(default_factory=MeasurementConfig)
     confidence: ConfidenceConfig = Field(default_factory=ConfidenceConfig)
@@ -111,7 +111,14 @@ class AppConfig(BaseModel):
     pipeline: PipelineConfig = Field(default_factory=PipelineConfig)
 
 
-def load_yaml(path: Path) -> dict[str, Any]:
+def pydantic_to_dict(model: BaseModel) -> Dict[str, Any]:
+    """Pydantic v1 (.dict) and v2 (.model_dump) compatibility."""
+    if hasattr(model, "model_dump"):
+        return model.model_dump()
+    return model.dict()
+
+
+def load_yaml(path: Path) -> Dict[str, Any]:
     with path.open("r", encoding="utf-8") as f:
         return yaml.safe_load(f) or {}
 
@@ -121,19 +128,28 @@ def resolve_path(base: Path, relative: str) -> Path:
     return p if p.is_absolute() else (base / p).resolve()
 
 
-def load_config(config_path: Path | str | None = None, project_root: Path | None = None) -> AppConfig:
+def load_config(
+    config_path: Optional[Union[Path, str]] = None,
+    project_root: Optional[Path] = None,
+) -> AppConfig:
     """Load main application config and resolve nested YAML references."""
     root = project_root or Path(__file__).resolve().parents[3]
     cfg_path = resolve_path(root, str(config_path or "configs/default.yaml"))
     raw = load_yaml(cfg_path)
-    return AppConfig.model_validate(raw)
+    if hasattr(AppConfig, "model_validate"):
+        return AppConfig.model_validate(raw)
+    return AppConfig.parse_obj(raw)
 
 
-def load_nested_config(config: AppConfig, key: str, project_root: Path | None = None) -> dict[str, Any]:
+def load_nested_config(
+    config: AppConfig,
+    key: str,
+    project_root: Optional[Path] = None,
+) -> Dict[str, Any]:
     root = project_root or Path(__file__).resolve().parents[3]
     section = getattr(config, key)
     if isinstance(section, dict) and "config_file" in section:
         return load_yaml(resolve_path(root, section["config_file"]))
-    if hasattr(section, "model_dump"):
-        return section.model_dump()
+    if isinstance(section, BaseModel):
+        return pydantic_to_dict(section)
     return dict(section) if isinstance(section, dict) else {}

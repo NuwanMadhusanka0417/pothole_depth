@@ -28,7 +28,7 @@ from pothole_vision.storage.database import ResultsDatabase
 from pothole_vision.storage.event_writer import EventWriter
 from pothole_vision.storage.results import save_detections_json, save_tracks_json
 from pothole_vision.tracking.tracker import PotholeTracker
-from pothole_vision.utils.config import AppConfig, load_config, load_nested_config, resolve_path
+from pothole_vision.utils.config import AppConfig, load_config, load_nested_config, pydantic_to_dict, resolve_path
 from pothole_vision.utils.video_paths import paths_for_video, resolve_video_path
 from pothole_vision.utils.logging import log_stage, setup_logging
 from pothole_vision.video.reader import VideoReader
@@ -112,7 +112,7 @@ class PotholePipeline:
                 sample = reader.read_frame(min(start_frame, meta.frame_count - 1))
                 if sample:
                     roi_vis = draw_roi_polygon(sample.image, self.roi_polygon)
-                    roi_vis = draw_zone_lines(roi_vis, self.config.zones.model_dump())
+                    roi_vis = draw_zone_lines(roi_vis, pydantic_to_dict(self.config.zones))
                     cv2.imwrite(str(self.output_dir / "roi_debug.jpg"), roi_vis)
 
             tracker = None
@@ -137,8 +137,8 @@ class PotholePipeline:
                 (meta.width, meta.height),
             )
 
-            quality_cfg = self.config.quality.model_dump()
-            zones_cfg = self.config.zones.model_dump()
+            quality_cfg = pydantic_to_dict(self.config.quality)
+            zones_cfg = pydantic_to_dict(self.config.zones)
 
             for frame in reader.iter_frames(
                 start_frame=start_frame,
@@ -294,7 +294,7 @@ class PotholePipeline:
                 scale_confidence=0.0,
                 geometry_confidence=0.0,
                 surface_confidence=0.0,
-                confidence_thresholds=self.config.confidence.model_dump(),
+                confidence_thresholds=pydantic_to_dict(self.config.confidence),
             )
 
             conf = compute_overall_confidence(

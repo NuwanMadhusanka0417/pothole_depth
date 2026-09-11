@@ -18,7 +18,7 @@ Input is only an ordinary `.mp4` dashcam video — no LiDAR, stereo, IMU, CAN-bu
 
 ## Requirements
 
-- Python 3.11+
+- Python 3.9+ (Gadi `module load python3/3.9.2` is supported)
 - CUDA GPU recommended (CPU works for short clips)
 
 ## Installation
