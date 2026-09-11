@@ -35,8 +35,23 @@ pip install -r requirements.txt
 Inspect all videos in `data/input/`:
 
 ```bash
+python scripts/validate_videos.py
 python scripts/inspect_video.py
 python scripts/run_pipeline.py --mode detection
+```
+
+If you see `error reading header` / `ftyp_in_header=False` / size very small, the MP4 on scratch is **corrupt or a partial copy** (common with OneDrive placeholders). Re-upload full files, then check:
+
+```bash
+ls -lh data/input/*.mp4
+module load ffmpeg
+ffprobe -v error -show_format -show_streams data/input/20260725_120804_NF.mp4
+```
+
+Re-mux if needed:
+
+```bash
+ffmpeg -i broken.mp4 -c:v libx264 -c:a aac fixed.mp4
 ```
 
 

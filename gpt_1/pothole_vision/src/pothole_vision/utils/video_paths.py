@@ -30,6 +30,8 @@ def discover_videos(
         for p in sorted(input_dir.glob(pattern)):
             resolved = p.resolve()
             if resolved.is_file() and resolved not in seen:
+                if resolved.stat().st_size < 1024:
+                    continue
                 seen.add(resolved)
                 videos.append(resolved)
     return sorted(videos, key=lambda x: x.name.lower())
